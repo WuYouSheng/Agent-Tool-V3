@@ -1,0 +1,10 @@
+{
+  0: "Successfully Execution",
+  1: "Program Error",
+  2: "Load config.json Error",
+  3: "Monitor Error",
+  4: "Apply config.json Error",
+  5: "tshark is not available",
+  6: "Can  not assemble command",
+  7: "Can not find proto file in the path"
+}

@@ -1,0 +1,12 @@
+{
+  "interface": "en0",
+  "listen_role": "dst",
+  "listen_port": 50051,
+  "service_type": "Sender",
+  "time_gap": 1,
+  "target_ip": "10.52.52.97",
+  "target_port": 9999,
+  "max_packet_size": 1000,
+  "debug":true,
+  "proto_path":"./Protobuf/"
+}

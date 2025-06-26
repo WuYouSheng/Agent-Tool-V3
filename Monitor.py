@@ -8,6 +8,9 @@ import subprocess
 from typing import Dict, Any, Optional
 import xml.etree.ElementTree as ET
 import signal
+import time
+from collections import deque
+import threading
 
 
 
@@ -29,6 +32,13 @@ class Sender:
         self.listen_port = None
         self.interface = None
         self.tshark_process = None
+
+        # FPS 計數相關
+        self.image_timestamps = deque()
+        self.current_fps = 0
+        self.fps_lock = threading.Lock()
+        self.last_fps_display_time = 0
+        self.fps_display_interval = 1.0  # 每秒顯示一次FPS
 
         signal.signal(signal.SIGINT, self._signal_handler)  # 處理Ctrl + c 中斷訊號，signal.SIGINT 為 2
         signal.signal(signal.SIGTERM, self._signal_handler)  # 處理其他程式中斷訊號，signal.SIGTERM 為 15
@@ -65,7 +75,8 @@ class Sender:
                 "target_ip",
                 "target_port",
                 "debug",
-                "proto_path"
+                "proto_path",
+                "fps_display_interval"
             ]
 
             missing_keys = [key for key in required_keys if key not in self.config]
@@ -109,6 +120,7 @@ class Sender:
         self.listen_role = self.config['listen_role']  # 被監聽的Port是接收端還是發送端
         self.listen_port = self.config['listen_port']  # 監聽Port
         self.interface = self.config['interface']  # 監聽介面
+        self.fps_display_interval = float(self.config['fps_display_interval'])  # 多久顯示一次fps數值更新
         return True
 
     def logging_setting(self):
@@ -233,7 +245,7 @@ class Sender:
                 field_info = {
                     'name': field_name,
                     'show': field.get('show'),
-                    'value': field.get('value'),
+                    'value': field.get('value', ''),  # 加入空字串預設值
                     'nested_fields': []
                 }
 
@@ -244,15 +256,24 @@ class Sender:
 
                 fields_list.append(field_info)
 
-    def _print_protobuf_fields(self, fields: list, indent: int = 0):
+    def _get_image_fields(self, fields: list, indent: int = 0):
         """遞迴列印 Protocol Buffers 欄位"""
         prefix = "  " * indent  # 縮排
 
         for field in fields:
             if "ffd9" in field['value'] and "ffd8" in field['value']:  # ffd8 開頭、 ffd9 結尾 為JPEG固定二進位編碼
+                # 發現新的JPEG影像，更新FPS計數
+                self.fps_count()
+
+                logging.info("Capture a JPEG image")
                 if self.DEBUG_MODE:
-                    print(f"{prefix}  原始值: {field['value']}")
-                    logging.info("Capture a JPEG image")
+                    print(f"{prefix}偵測到JPEG影像")
+                    #print(f"{prefix}  原始值: {field['value']}")
+
+            # 遞迴處理巢狀欄位
+            if field.get('nested_fields'):
+                self._get_image_fields(field['nested_fields'], indent + 1)
+
 
     def monitor(self):
         if not self._check_tshark_(): # 確認是否有安裝Wireshark
@@ -262,6 +283,7 @@ class Sender:
 
         if self.DEBUG_MODE:
             print(f"執行命令: {' '.join(cmd)}")
+            print("開始監聽影像流，FPS計數器已啟動...")  # 更新這行
             print("-" * 60)
 
         try:
@@ -292,8 +314,7 @@ class Sender:
                     if line.startswith('</packet>'):
                         packet_data = self._parse_pdml_packet(pdml_buffer)
                         if packet_data:
-                            if self.DEBUG_MODE:
-                                self._print_protobuf_fields(packet_data['protobuf_fields'], indent=1)
+                            self._get_image_fields(packet_data['protobuf_fields'], indent=1)
 
                         # 重置緩衝區
                         pdml_buffer = ""
@@ -321,7 +342,43 @@ class Sender:
             finally:
                 self.tshark_process = None
 
-        print("監聽已停止")
+        # 顯示最終FPS統計（新增部分）
+        final_fps = self.get_current_fps()
+        print(f"監聽已停止 - 最終FPS: {final_fps}")
+        logging.info(f"Monitoring stopped - Final FPS: {final_fps}")
+
+    def fps_count(self):
+        """FPS計數功能 - 記錄一張新影像"""
+        current_time = time.time()
+        with self.fps_lock:
+            # 添加當前時間戳
+            self.image_timestamps.append(current_time)
+
+            # 移除超過1秒的舊時間戳
+            while self.image_timestamps and current_time - self.image_timestamps[0] > 1.0:
+                self.image_timestamps.popleft()
+
+            # 更新當前FPS
+            self.current_fps = len(self.image_timestamps)
+
+            # 每時間間隔顯示一次FPS（避免過於頻繁的輸出）
+            if current_time - self.last_fps_display_time >= self.fps_display_interval:
+                self.last_fps_display_time = current_time
+                if self.DEBUG_MODE:
+                    print(f"[FPS] 當前影像傳輸速率: {self.current_fps} fps")
+                logging.info(f"Current FPS: {self.current_fps}")
+
+        return self.current_fps
+
+    def get_current_fps(self):
+        """取得當前FPS值"""
+        current_time = time.time()
+        with self.fps_lock:
+            # 清理過期的時間戳
+            while self.image_timestamps and current_time - self.image_timestamps[0] > 1.0:
+                self.image_timestamps.popleft()
+            self.current_fps = len(self.image_timestamps)
+            return self.current_fps
 
 
 def main():

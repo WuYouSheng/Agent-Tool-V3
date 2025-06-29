@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+from datetime import datetime
 import os
 import sys
 import json
@@ -11,8 +12,7 @@ import signal
 import time
 from collections import deque
 import threading
-
-
+import hashlib
 
 class Sender:
     def __init__(self, config_path="./sender_config.json"):
@@ -38,7 +38,30 @@ class Sender:
         self.current_fps = 0
         self.fps_lock = threading.Lock()
         self.last_fps_display_time = 0
-        self.fps_display_interval = 1.0  # 每秒顯示一次FPS
+        self.fps_display_interval = 1.0  # 每多少秒顯示一次FPS
+        self.image_save = None # 是否儲存每一幀影像
+        self.image_save_path = None
+
+        # JPEG完整幀檢測變數
+        self.jpeg_buffer = bytearray()  # 累積JPEG數據
+        self.in_jpeg_frame = False  # 是否正在接收JPEG幀
+        self.jpeg_start_marker = bytes.fromhex('ffd8')  # JPEG開始標記
+        self.jpeg_end_marker = bytes.fromhex('ffd9')  # JPEG結束標記
+
+        # 幀去重複相關變數
+        self.frame_hashes = deque(maxlen=100)  # 保存最近100幀的hash值
+        self.frame_timestamps = {}  # 儲存幀的時間戳記
+        self.current_stream_time = None  # 當前幀的時間戳記
+        self.frame_hash_lock = threading.Lock()
+
+        # JPEG驗證
+        self.min_jpeg_size = 1024  # 最小JPEG大小（bytes）
+        self.max_jpeg_size = 10 * 1024 * 1024  # 最大JPEG大小（10MB）
+
+        # 簡單統計
+        self.total_packets = 0  # 總封包數
+        self.complete_frames = 0  # 完整幀數
+        self.duplicate_frames = 0  # 重複幀數
 
         signal.signal(signal.SIGINT, self._signal_handler)  # 處理Ctrl + c 中斷訊號，signal.SIGINT 為 2
         signal.signal(signal.SIGTERM, self._signal_handler)  # 處理其他程式中斷訊號，signal.SIGTERM 為 15
@@ -69,14 +92,15 @@ class Sender:
             # 驗證必要的配置項目
             required_keys = [
                 "interface",
-                "listen_port",
                 "listen_role",
+                "listen_port",
                 "service_type",
+                "fps_display_interval",
                 "target_ip",
                 "target_port",
                 "debug",
                 "proto_path",
-                "fps_display_interval"
+                "image_save"
             ]
 
             missing_keys = [key for key in required_keys if key not in self.config]
@@ -121,6 +145,8 @@ class Sender:
         self.listen_port = self.config['listen_port']  # 監聽Port
         self.interface = self.config['interface']  # 監聽介面
         self.fps_display_interval = float(self.config['fps_display_interval'])  # 多久顯示一次fps數值更新
+        self.image_save = self.config['image_save']
+        self.image_save_path = self.config['image_save_path']
         return True
 
     def logging_setting(self):
@@ -171,7 +197,7 @@ class Sender:
 
     def _signal_handler(self, signum, frame):
         # frame不可省略，必須帶入此參數
-        if signum==2 or signum==15:
+        if signum == 2 or signum == 15:
             """處理中斷信號"""
             print(f"\n收到信號 {signum}，正在停止監聽...")
             self.stop()
@@ -212,18 +238,8 @@ class Sender:
             for proto in root.findall('.//proto'):
                 proto_name = proto.get('name', '')
 
-                # 解析 gRPC 層資訊
-                if proto_name == 'grpc':
-                    grpc_message = proto.find('.//field[@name="grpc.message_type"]')
-                    if grpc_message is not None and grpc_message.get('show') == '1':
-                        # gRPC DATA 訊息
-                        packet_info['grpc_message_type'] = 'DATA'
-                        logging.info(f"gRPC DATA: {packet_info['grpc_message_type']}")
-                        if self.DEBUG_MODE:
-                            print(f"gRPC DATA: {packet_info['grpc_message_type']}")
-
                 # 解析 Protocol Buffers 資訊
-                elif proto_name == 'protobuf':
+                if proto_name == 'protobuf':
                     self._extract_protobuf_fields(proto, packet_info['protobuf_fields'])
 
             return packet_info if packet_info['protobuf_fields'] else None
@@ -249,31 +265,224 @@ class Sender:
                     'nested_fields': []
                 }
 
-                # 遞迴處理巢狀訊息
-                nested_messages = field.findall('.//field[@name="protobuf.message"]')
-                for nested_msg in nested_messages:
-                    self._extract_protobuf_fields(nested_msg, field_info['nested_fields'])
-
                 fields_list.append(field_info)
 
     def _get_image_fields(self, fields: list, indent: int = 0):
-        """遞迴列印 Protocol Buffers 欄位"""
-        prefix = "  " * indent  # 縮排
+        """處理JPEG分片並重組完整幀"""
+        # 重置當前幀的時間戳
+        self.current_stream_time = None
 
         for field in fields:
-            if "ffd9" in field['value'] and "ffd8" in field['value']:  # ffd8 開頭、 ffd9 結尾 為JPEG固定二進位編碼
-                # 發現新的JPEG影像，更新FPS計數
-                self.fps_count()
+            if isinstance(field.get('value'), str) and field['value']:
+                # 只處理包含數據的欄位
+                hex_data = field['value']
+                if len(hex_data) > 8:  # 過濾太短的data
+                    self._process_jpeg_data(hex_data)
 
-                logging.info("Capture a JPEG image")
+    def _get_time_fields(self, fields: list):
+        """提取時間欄位"""
+        for field in fields:
+            if field['name'] == 'protobuf.field.value.int64':
+                try:
+                    stream_time = int(field.get('show'))
+                    self.current_stream_time = stream_time
+                    self.latency_count(stream_time)
+                except (ValueError, TypeError):
+                    if self.DEBUG_MODE:
+                        print(f"無法解析時間戳記: {field.get('show')}")
+
+    def _process_jpeg_data(self, hex_data: str):
+        """處理JPEG數據分片"""
+        try:
+            data_bytes = bytes.fromhex(hex_data)
+            self.total_packets += 1
+
+            # 檢測JPEG開始標記
+            jpeg_start_pos = data_bytes.find(self.jpeg_start_marker)
+            if jpeg_start_pos != -1:
+                # 如果正在處理前一幀，先完成它
+                if self.in_jpeg_frame and len(self.jpeg_buffer) > 0:
+                    self._complete_current_frame()
+
+                # 開始新幀
+                self.in_jpeg_frame = True
+                self.jpeg_buffer = bytearray()
+                self.jpeg_buffer.extend(data_bytes[jpeg_start_pos:])
+
                 if self.DEBUG_MODE:
-                    print(f"{prefix}偵測到JPEG影像")
-                    #print(f"{prefix}  原始值: {field['value']}")
+                    print(f"新JPEG幀開始")
 
-            # 遞迴處理巢狀欄位
-            if field.get('nested_fields'):
-                self._get_image_fields(field['nested_fields'], indent + 1)
+            elif self.in_jpeg_frame:
+                # 累積數據
+                self.jpeg_buffer.extend(data_bytes)
 
+            # 檢測JPEG結束標記
+            jpeg_end_pos = data_bytes.find(self.jpeg_end_marker)
+            if jpeg_end_pos != -1 and self.in_jpeg_frame:
+                self._complete_current_frame()
+
+        except ValueError:
+            if self.DEBUG_MODE:
+                print("警告: 無效的十六進位數據")
+        except Exception as e:
+            if self.DEBUG_MODE:
+                print(f"JPEG處理錯誤: {e}")
+
+    def _complete_current_frame(self):
+        """完成當前JPEG幀"""
+        if not self.in_jpeg_frame or len(self.jpeg_buffer) == 0:
+            return
+
+        frame_size = len(self.jpeg_buffer)
+
+        # JPEG驗證
+        if not self._is_valid_jpeg_enhanced():
+            if self.DEBUG_MODE:
+                print(f"無效的JPEG幀，大小: {frame_size} bytes")
+            self._reset_frame_state()
+            return
+
+        # 計算幀的hash值用於去重複幀
+        frame_hash = self._calculate_frame_hash(self.jpeg_buffer)
+
+        # 檢查是否為重複幀
+        if self._is_duplicate_frame(frame_hash):
+            self.duplicate_frames += 1
+            if self.DEBUG_MODE:
+                print(f"檢測到重複幀 (Hash: {frame_hash[:8]}...), 總重複數: {self.duplicate_frames}")
+            self._reset_frame_state()
+            return
+
+        # 這是新的一幀
+        self.complete_frames += 1
+        self._add_frame_hash(frame_hash)
+
+        # 計入FPS
+        self.fps_count()
+
+        if self.DEBUG_MODE:
+            print(f"完整JPEG幀: {frame_size:,} 字節 (總計: {self.complete_frames}, 重複: {self.duplicate_frames})")
+            print(f"幀Hash: {frame_hash[:8]}...")
+
+        # 儲存影像
+        if self.image_save:
+            self.save_image_bytes(self.jpeg_buffer, frame_hash)
+
+        # 重置狀態
+        self._reset_frame_state()
+
+    def _is_valid_jpeg_enhanced(self):
+        """驗證JPEG有效性"""
+        if len(self.jpeg_buffer) < self.min_jpeg_size:
+            return False
+
+        if len(self.jpeg_buffer) > self.max_jpeg_size:
+            return False
+
+        # 檢查JPEG標頭和結尾
+        has_start = self.jpeg_buffer[:2] == self.jpeg_start_marker
+        has_end = self.jpeg_buffer[-2:] == self.jpeg_end_marker
+
+        if not (has_start and has_end):
+            return False
+
+        # 檢查JPEG檔案結構的基本標記
+        # 尋找APP0標記 (FFE0) 或其他常見的JPEG標記
+        has_app_marker = False
+        for i in range(2, min(20, len(self.jpeg_buffer) - 1)):
+            if self.jpeg_buffer[i] == 0xFF:
+                next_byte = self.jpeg_buffer[i + 1]
+                # 檢查是否為有效的JPEG標記
+                if next_byte in [0xE0, 0xE1, 0xE2, 0xDB, 0xC0, 0xC4]:  # APP0, APP1, APP2, DQT, SOF0, DHT
+                    has_app_marker = True
+                    break
+
+        return has_app_marker
+
+    def _calculate_frame_hash(self, frame_data: bytearray) -> str:
+        """計算幀的SHA256 hash值"""
+        return hashlib.sha256(frame_data).hexdigest()
+
+    def _is_duplicate_frame(self, frame_hash: str) -> bool:
+        """檢查是否為重複幀"""
+        with self.frame_hash_lock:
+            return frame_hash in self.frame_hashes
+
+    def _add_frame_hash(self, frame_hash: str):
+        """添加每一幀的hash到 frame_hashes 中"""
+        with self.frame_hash_lock:
+            self.frame_hashes.append(frame_hash)
+            # 如果有時間戳記，也記錄下來
+            if self.current_stream_time:
+                self.frame_timestamps[frame_hash] = self.current_stream_time
+
+    def _reset_frame_state(self):
+        """重置幀數處理狀態"""
+        self.in_jpeg_frame = False
+        self.jpeg_buffer = bytearray()
+        self.current_stream_time = None
+
+    def save_image_bytes(self, image_bytes: bytearray, frame_hash: str = None):
+        """儲存完整的JPEG影像bytes"""
+        try:
+            # 確保儲存資料夾存在
+            if not os.path.exists(self.image_save_path):
+                os.makedirs(self.image_save_path)
+
+            # 產生以當前時間和hash為名稱的檔案名
+            current_time = datetime.now()
+            timestamp = current_time.strftime("%Y%m%d_%H%M%S_%f")
+
+            if frame_hash:
+                filename = f"{timestamp}_{frame_hash[:8]}.jpg"
+            else:
+                filename = f"{timestamp}.jpg"
+
+            # 完整檔案路徑
+            file_path = os.path.join(self.image_save_path, filename)
+
+            # 寫入檔案
+            with open(file_path, 'wb') as f:
+                f.write(image_bytes)
+
+            logging.info(f"完整影像已儲存至: {file_path}")
+            return file_path
+
+        except Exception as e:
+            logging.error(f"儲存影像失敗: {e}")
+            return None
+
+    def fps_count(self):
+        """FPS計數功能 - 只計算完整且非重複的JPEG幀"""
+        current_time = time.time()
+        with self.fps_lock:
+            # 添加當前時間戳
+            self.image_timestamps.append(current_time)
+
+            # 移除超過1秒的舊時間戳
+            while self.image_timestamps and current_time - self.image_timestamps[0] > 1.0:
+                self.image_timestamps.popleft()
+
+            # 更新當前FPS
+            self.current_fps = len(self.image_timestamps)
+
+            # 每時間間隔顯示一次FPS
+            if current_time - self.last_fps_display_time >= self.fps_display_interval:
+                self.last_fps_display_time = current_time
+                print(f"[真實FPS] 完整且唯一幀率: {self.current_fps} fps (排除重複: {self.duplicate_frames})")
+                logging.info(f"Real Unique Frame FPS: {self.current_fps}, Duplicates: {self.duplicate_frames}")
+
+        return self.current_fps
+
+    def latency_count(self,stream_time_int64):
+        current_time = int(time.time_ns() // 1_000_000) #取得目前時間到毫秒
+        # print(current_time)
+        # print(stream_time_int64)
+
+        latency_time = current_time - stream_time_int64
+        if self.DEBUG_MODE:
+            print(f"延遲為 {latency_time} 毫秒")
+        print(f"延遲為 {latency_time} 毫秒")
 
     def monitor(self):
         if not self._check_tshark_(): # 確認是否有安裝Wireshark
@@ -314,7 +523,8 @@ class Sender:
                     if line.startswith('</packet>'):
                         packet_data = self._parse_pdml_packet(pdml_buffer)
                         if packet_data:
-                            self._get_image_fields(packet_data['protobuf_fields'], indent=1)
+                            self._get_time_fields(packet_data['protobuf_fields'])  # 一定要先計算延遲
+                            self._get_image_fields(packet_data['protobuf_fields'], indent=1)  # 再處理影片，不然延遲會大幅增加
 
                         # 重置緩衝區
                         pdml_buffer = ""
@@ -326,6 +536,7 @@ class Sender:
             print(f"監聽過程中發生錯誤: {e}")
         finally:
             self.stop()
+
     def stop(self):
         """停止監聽"""
         if self.tshark_process:
@@ -341,45 +552,6 @@ class Sender:
                 logging.info(f"Listening Terminate ERROR")
             finally:
                 self.tshark_process = None
-
-        # 顯示最終FPS統計（新增部分）
-        final_fps = self.get_current_fps()
-        print(f"監聽已停止 - 最終FPS: {final_fps}")
-        logging.info(f"Monitoring stopped - Final FPS: {final_fps}")
-
-    def fps_count(self):
-        """FPS計數功能 - 記錄一張新影像"""
-        current_time = time.time()
-        with self.fps_lock:
-            # 添加當前時間戳
-            self.image_timestamps.append(current_time)
-
-            # 移除超過1秒的舊時間戳
-            while self.image_timestamps and current_time - self.image_timestamps[0] > 1.0:
-                self.image_timestamps.popleft()
-
-            # 更新當前FPS
-            self.current_fps = len(self.image_timestamps)
-
-            # 每時間間隔顯示一次FPS（避免過於頻繁的輸出）
-            if current_time - self.last_fps_display_time >= self.fps_display_interval:
-                self.last_fps_display_time = current_time
-                if self.DEBUG_MODE:
-                    print(f"[FPS] 當前影像傳輸速率: {self.current_fps} fps")
-                logging.info(f"Current FPS: {self.current_fps}")
-
-        return self.current_fps
-
-    def get_current_fps(self):
-        """取得當前FPS值"""
-        current_time = time.time()
-        with self.fps_lock:
-            # 清理過期的時間戳
-            while self.image_timestamps and current_time - self.image_timestamps[0] > 1.0:
-                self.image_timestamps.popleft()
-            self.current_fps = len(self.image_timestamps)
-            return self.current_fps
-
 
 def main():
     sender = Sender()
